@@ -37,21 +37,36 @@ namespace Json {
  *
  * We use nothing but these internally. Of course, STL can throw others.
  */
-class JSON_API Exception;
+class JSON_API Exception : public std::exception {
+public:
+  Exception(std::string const& msg);
+  ~Exception() throw() override;
+  char const* what() const throw() override;
+protected:
+  std::string msg_;
+};
+
 /** Exceptions which the user cannot easily avoid.
  *
  * E.g. out-of-memory (when we use malloc), stack-overflow, malicious input
  * 
  * \remark derived from Json::Exception
  */
-class JSON_API RuntimeError;
+class JSON_API RuntimeError : public Exception {
+public:
+  RuntimeError(std::string const& msg);
+};
+
 /** Exceptions thrown by JSON_ASSERT/JSON_FAIL macros.
  *
  * These are precondition-violations (user bugs) and internal errors (our bugs).
  * 
  * \remark derived from Json::Exception
  */
-class JSON_API LogicError;
+class JSON_API LogicError : public Exception {
+public:
+  LogicError(std::string const& msg);
+};
 
 /// used internally
 void throwRuntimeError(std::string const& msg);
@@ -197,6 +212,9 @@ private:
     CZString(ArrayIndex index);
     CZString(char const* str, unsigned length, DuplicationPolicy allocate);
     CZString(CZString const& other);
+#if JSON_HAS_RVALUE_REFERENCES
+    CZString(CZString&& other);
+#endif
     ~CZString();
     CZString& operator=(CZString other);
     bool operator<(CZString const& other) const;
@@ -255,7 +273,7 @@ Json::Value obj_value(Json::objectValue); // {}
 #endif // if defined(JSON_HAS_INT64)
   Value(double value);
   Value(const char* value); ///< Copy til first 0. (NULL causes to seg-fault.)
-  Value(const char* beginValue, const char* endValue); ///< Copy all, incl zeroes.
+  Value(const char* begin, const char* end); ///< Copy all, incl zeroes.
   /** \brief Constructs a value from a static string.
 
    * Like other value string constructor but do not duplicate the string for
@@ -279,6 +297,10 @@ Json::Value obj_value(Json::objectValue); // {}
   Value(bool value);
   /// Deep copy.
   Value(const Value& other);
+#if JSON_HAS_RVALUE_REFERENCES
+  /// Move constructor
+  Value(Value&& other);
+#endif
   ~Value();
 
   /// Deep copy, then swap(other).
@@ -306,7 +328,7 @@ Json::Value obj_value(Json::objectValue); // {}
    *  \return false if !string. (Seg-fault if str or end are NULL.)
    */
   bool getString(
-      char const** str, char const** end) const;
+      char const** begin, char const** end) const;
 #ifdef JSON_USE_CPPTL
   CppTL::ConstString asConstString() const;
 #endif
@@ -435,8 +457,8 @@ Json::Value obj_value(Json::objectValue); // {}
   Value get(const char* key, const Value& defaultValue) const;
   /// Return the member named key if it exist, defaultValue otherwise.
   /// \note deep copy
-  /// \param key may contain embedded nulls.
-  Value get(const char* key, const char* end, const Value& defaultValue) const;
+  /// \note key may contain embedded nulls.
+  Value get(const char* begin, const char* end, const Value& defaultValue) const;
   /// Return the member named key if it exist, defaultValue otherwise.
   /// \note deep copy
   /// \param key may contain embedded nulls.
@@ -448,12 +470,12 @@ Json::Value obj_value(Json::objectValue); // {}
 #endif
   /// Most general and efficient version of isMember()const, get()const,
   /// and operator[]const
-  /// \note As stated elsewhere, behavior is undefined if (end-key) >= 2^30
-  Value const* find(char const* key, char const* end) const;
+  /// \note As stated elsewhere, behavior is undefined if (end-begin) >= 2^30
+  Value const* find(char const* begin, char const* end) const;
   /// Most general and efficient version of object-mutators.
-  /// \note As stated elsewhere, behavior is undefined if (end-key) >= 2^30
+  /// \note As stated elsewhere, behavior is undefined if (end-begin) >= 2^30
   /// \return non-zero, but JSON_ASSERT if this is neither object nor nullValue.
-  Value const* demand(char const* key, char const* end);
+  Value const* demand(char const* begin, char const* end);
   /// \brief Remove and return the named member.
   ///
   /// Do nothing if it did not exist.
@@ -466,7 +488,7 @@ Json::Value obj_value(Json::objectValue); // {}
   /// \param key may contain embedded nulls.
   /// \deprecated
   Value removeMember(const std::string& key);
-  /// Same as removeMember(const char* key, const char* end, Value* removed),
+  /// Same as removeMember(const char* begin, const char* end, Value* removed),
   /// but 'key' is null-terminated.
   bool removeMember(const char* key, Value* removed);
   /** \brief Remove the named map member.
@@ -477,7 +499,7 @@ Json::Value obj_value(Json::objectValue); // {}
   */
   bool removeMember(std::string const& key, Value* removed);
   /// Same as removeMember(std::string const& key, Value* removed)
-  bool removeMember(const char* key, const char* end, Value* removed);
+  bool removeMember(const char* begin, const char* end, Value* removed);
   /** \brief Remove the indexed array element.
 
       O(n) expensive operations.
@@ -493,7 +515,7 @@ Json::Value obj_value(Json::objectValue); // {}
   /// \param key may contain embedded nulls.
   bool isMember(const std::string& key) const;
   /// Same as isMember(std::string const& key)const
-  bool isMember(const char* key, const char* end) const;
+  bool isMember(const char* begin, const char* end) const;
 #ifdef JSON_USE_CPPTL
   /// Return true if the object has a member named key.
   bool isMember(const CppTL::ConstString& key) const;
@@ -532,10 +554,10 @@ Json::Value obj_value(Json::objectValue); // {}
 
   // Accessors for the [start, limit) range of bytes within the JSON text from
   // which this value was parsed, if any.
-  void setOffsetStart(size_t start);
-  void setOffsetLimit(size_t limit);
-  size_t getOffsetStart() const;
-  size_t getOffsetLimit() const;
+  void setOffsetStart(ptrdiff_t start);
+  void setOffsetLimit(ptrdiff_t limit);
+  ptrdiff_t getOffsetStart() const;
+  ptrdiff_t getOffsetLimit() const;
 
 private:
   void initBasic(ValueType type, bool allocated = false);
@@ -576,8 +598,8 @@ private:
 
   // [start, limit) byte offsets in the source JSON text from which this Value
   // was extracted.
-  size_t start_;
-  size_t limit_;
+  ptrdiff_t start_;
+  ptrdiff_t limit_;
 };
 
 /** \brief Experimental and untested: represents an element of the "path" to
@@ -723,6 +745,7 @@ public:
   typedef ValueConstIterator SelfType;
 
   ValueConstIterator();
+  ValueConstIterator(ValueIterator const& other);
 
 private:
 /*! \internal Use by Value to create an iterator.
@@ -772,7 +795,7 @@ public:
   typedef ValueIterator SelfType;
 
   ValueIterator();
-  ValueIterator(const ValueConstIterator& other);
+  explicit ValueIterator(const ValueConstIterator& other);
   ValueIterator(const ValueIterator& other);
 
 private:

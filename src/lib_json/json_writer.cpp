@@ -20,19 +20,46 @@
 #include <float.h>
 #define isfinite _finite
 #elif defined(__sun) && defined(__SVR4) //Solaris
+#if !defined(isfinite)
 #include <ieeefp.h>
 #define isfinite finite
+#endif
+#elif defined(_AIX)
+#if !defined(isfinite)
+#include <math.h>
+#define isfinite finite
+#endif
+#elif defined(__hpux)
+#if !defined(isfinite)
+#if defined(__ia64) && !defined(finite)
+#define isfinite(x) ((sizeof(x) == sizeof(float) ? \
+                     _Isfinitef(x) : _IsFinite(x)))
+#else
+#include <math.h>
+#define isfinite finite
+#endif
+#endif
 #else
 #include <cmath>
+#if !(defined(__QNXNTO__)) // QNX already defines isfinite
 #define isfinite std::isfinite
 #endif
+#endif
 
-#if defined(_MSC_VER) && _MSC_VER < 1500 // VC++ 8.0 and below
+#if defined(_MSC_VER)
+#if !defined(WINCE) && defined(__STDC_SECURE_LIB__) && _MSC_VER >= 1500 // VC++ 9.0 and above
+#define snprintf sprintf_s
+#elif _MSC_VER >= 1900 // VC++ 14.0 and above
+#define snprintf std::snprintf
+#else
 #define snprintf _snprintf
-#elif defined(__ANDROID__)
+#endif
+#elif defined(__ANDROID__) || defined(__QNXNTO__)
 #define snprintf snprintf
 #elif __cplusplus >= 201103L
+#if !defined(__MINGW32__) && !defined(__CYGWIN__)
 #define snprintf std::snprintf
+#endif
 #endif
 
 #if defined(__BORLANDC__)  
@@ -48,7 +75,7 @@
 
 namespace Json {
 
-#if __cplusplus >= 201103L
+#if __cplusplus >= 201103L || (defined(_CPPLIB_VER) && _CPPLIB_VER >= 520)
 typedef std::unique_ptr<StreamWriter> StreamWriterPtr;
 #else
 typedef std::auto_ptr<StreamWriter>   StreamWriterPtr;
@@ -75,12 +102,15 @@ static bool containsControlCharacter0(const char* str, unsigned len) {
 std::string valueToString(LargestInt value) {
   UIntToStringBuffer buffer;
   char* current = buffer + sizeof(buffer);
-  bool isNegative = value < 0;
-  if (isNegative)
-    value = -value;
-  uintToString(LargestUInt(value), current);
-  if (isNegative)
+  if (value == Value::minLargestInt) {
+    uintToString(LargestUInt(Value::maxLargestInt) + 1, current);
     *--current = '-';
+  } else if (value < 0) {
+    uintToString(LargestUInt(-value), current);
+    *--current = '-';
+  } else {
+    uintToString(LargestUInt(value), current);
+  }
   assert(current >= buffer);
   return current;
 }
@@ -105,42 +135,37 @@ std::string valueToString(UInt value) {
 
 #endif // # if defined(JSON_HAS_INT64)
 
-std::string valueToString(double value) {
+std::string valueToString(double value, bool useSpecialFloats, unsigned int precision) {
   // Allocate a buffer that is more than large enough to store the 16 digits of
   // precision requested below.
   char buffer[32];
   int len = -1;
 
-// Print into the buffer. We need not request the alternative representation
-// that always has a decimal point because JSON doesn't distingish the
-// concepts of reals and integers.
-#if defined(_MSC_VER) && defined(__STDC_SECURE_LIB__) // Use secure version with
-                                                      // visual studio 2005 to
-                                                      // avoid warning.
-#if defined(WINCE)
-  len = _snprintf(buffer, sizeof(buffer), "%.17g", value);
-#else
-  len = sprintf_s(buffer, sizeof(buffer), "%.17g", value);
-#endif
-#else
+  char formatString[6];
+  sprintf(formatString, "%%.%dg", precision);
+
+  // Print into the buffer. We need not request the alternative representation
+  // that always has a decimal point because JSON doesn't distingish the
+  // concepts of reals and integers.
   if (isfinite(value)) {
-    len = snprintf(buffer, sizeof(buffer), "%.17g", value);
+    len = snprintf(buffer, sizeof(buffer), formatString, value);
   } else {
     // IEEE standard states that NaN values will not compare to themselves
     if (value != value) {
-      len = snprintf(buffer, sizeof(buffer), "null");
+      len = snprintf(buffer, sizeof(buffer), useSpecialFloats ? "NaN" : "null");
     } else if (value < 0) {
-      len = snprintf(buffer, sizeof(buffer), "-1e+9999");
+      len = snprintf(buffer, sizeof(buffer), useSpecialFloats ? "-Infinity" : "-1e+9999");
     } else {
-      len = snprintf(buffer, sizeof(buffer), "1e+9999");
+      len = snprintf(buffer, sizeof(buffer), useSpecialFloats ? "Infinity" : "1e+9999");
     }
     // For those, we do not need to call fixNumLoc, but it is fast.
   }
-#endif
   assert(len >= 0);
   fixNumericLocale(buffer, buffer + len);
   return buffer;
 }
+
+std::string valueToString(double value) { return valueToString(value, false, 17); }
 
 std::string valueToString(bool value) { return value ? "true" : "false"; }
 
@@ -338,8 +363,8 @@ void FastWriter::writeValue(const Value& value) {
     break;
   case arrayValue: {
     document_ += '[';
-    int size = value.size();
-    for (int index = 0; index < size; ++index) {
+    ArrayIndex size = value.size();
+    for (ArrayIndex index = 0; index < size; ++index) {
       if (index > 0)
         document_ += ',';
       writeValue(value[index]);
@@ -354,7 +379,7 @@ void FastWriter::writeValue(const Value& value) {
       const std::string& name = *it;
       if (it != members.begin())
         document_ += ',';
-      document_ += valueToQuotedStringN(name.data(), name.length());
+      document_ += valueToQuotedStringN(name.data(), static_cast<unsigned>(name.length()));
       document_ += yamlCompatiblityEnabled_ ? ": " : ":";
       writeValue(value[name]);
     }
@@ -483,26 +508,25 @@ void StyledWriter::writeArrayValue(const Value& value) {
 }
 
 bool StyledWriter::isMultineArray(const Value& value) {
-  int size = value.size();
+  ArrayIndex const size = value.size();
   bool isMultiLine = size * 3 >= rightMargin_;
   childValues_.clear();
-  for (int index = 0; index < size && !isMultiLine; ++index) {
+  for (ArrayIndex index = 0; index < size && !isMultiLine; ++index) {
     const Value& childValue = value[index];
-    isMultiLine =
-        isMultiLine || ((childValue.isArray() || childValue.isObject()) &&
+    isMultiLine = ((childValue.isArray() || childValue.isObject()) &&
                         childValue.size() > 0);
   }
   if (!isMultiLine) // check if line length > max line length
   {
     childValues_.reserve(size);
     addChildValues_ = true;
-    int lineLength = 4 + (size - 1) * 2; // '[ ' + ', '*n + ' ]'
-    for (int index = 0; index < size; ++index) {
+    ArrayIndex lineLength = 4 + (size - 1) * 2; // '[ ' + ', '*n + ' ]'
+    for (ArrayIndex index = 0; index < size; ++index) {
       if (hasCommentForValue(value[index])) {
         isMultiLine = true;
       }
       writeValue(value[index]);
-      lineLength += int(childValues_[index].length());
+      lineLength += static_cast<ArrayIndex>(childValues_[index].length());
     }
     addChildValues_ = false;
     isMultiLine = isMultiLine || lineLength >= rightMargin_;
@@ -536,7 +560,7 @@ void StyledWriter::writeWithIndent(const std::string& value) {
 void StyledWriter::indent() { indentString_ += std::string(indentSize_, ' '); }
 
 void StyledWriter::unindent() {
-  assert(int(indentString_.size()) >= indentSize_);
+  assert(indentString_.size() >= indentSize_);
   indentString_.resize(indentString_.size() - indentSize_);
 }
 
@@ -703,26 +727,25 @@ void StyledStreamWriter::writeArrayValue(const Value& value) {
 }
 
 bool StyledStreamWriter::isMultineArray(const Value& value) {
-  int size = value.size();
+  ArrayIndex const size = value.size();
   bool isMultiLine = size * 3 >= rightMargin_;
   childValues_.clear();
-  for (int index = 0; index < size && !isMultiLine; ++index) {
+  for (ArrayIndex index = 0; index < size && !isMultiLine; ++index) {
     const Value& childValue = value[index];
-    isMultiLine =
-        isMultiLine || ((childValue.isArray() || childValue.isObject()) &&
+    isMultiLine = ((childValue.isArray() || childValue.isObject()) &&
                         childValue.size() > 0);
   }
   if (!isMultiLine) // check if line length > max line length
   {
     childValues_.reserve(size);
     addChildValues_ = true;
-    int lineLength = 4 + (size - 1) * 2; // '[ ' + ', '*n + ' ]'
-    for (int index = 0; index < size; ++index) {
+    ArrayIndex lineLength = 4 + (size - 1) * 2; // '[ ' + ', '*n + ' ]'
+    for (ArrayIndex index = 0; index < size; ++index) {
       if (hasCommentForValue(value[index])) {
         isMultiLine = true;
       }
       writeValue(value[index]);
-      lineLength += int(childValues_[index].length());
+      lineLength += static_cast<ArrayIndex>(childValues_[index].length());
     }
     addChildValues_ = false;
     isMultiLine = isMultiLine || lineLength >= rightMargin_;
@@ -813,8 +836,10 @@ struct BuiltStyledStreamWriter : public StreamWriter
       CommentStyle::Enum cs,
       std::string const& colonSymbol,
       std::string const& nullSymbol,
-      std::string const& endingLineFeedSymbol);
-  virtual int write(Value const& root, std::ostream* sout);
+      std::string const& endingLineFeedSymbol,
+      bool useSpecialFloats,
+      unsigned int precision);
+  int write(Value const& root, std::ostream* sout) override;
 private:
   void writeValue(Value const& value);
   void writeArrayValue(Value const& value);
@@ -832,7 +857,7 @@ private:
 
   ChildValues childValues_;
   std::string indentString_;
-  int rightMargin_;
+  unsigned int rightMargin_;
   std::string indentation_;
   CommentStyle::Enum cs_;
   std::string colonSymbol_;
@@ -840,13 +865,17 @@ private:
   std::string endingLineFeedSymbol_;
   bool addChildValues_ : 1;
   bool indented_ : 1;
+  bool useSpecialFloats_ : 1;
+  unsigned int precision_;
 };
 BuiltStyledStreamWriter::BuiltStyledStreamWriter(
       std::string const& indentation,
       CommentStyle::Enum cs,
       std::string const& colonSymbol,
       std::string const& nullSymbol,
-      std::string const& endingLineFeedSymbol)
+      std::string const& endingLineFeedSymbol,
+      bool useSpecialFloats,
+      unsigned int precision)
   : rightMargin_(74)
   , indentation_(indentation)
   , cs_(cs)
@@ -855,6 +884,8 @@ BuiltStyledStreamWriter::BuiltStyledStreamWriter(
   , endingLineFeedSymbol_(endingLineFeedSymbol)
   , addChildValues_(false)
   , indented_(false)
+  , useSpecialFloats_(useSpecialFloats)
+  , precision_(precision)
 {
 }
 int BuiltStyledStreamWriter::write(Value const& root, std::ostream* sout)
@@ -884,7 +915,7 @@ void BuiltStyledStreamWriter::writeValue(Value const& value) {
     pushValue(valueToString(value.asLargestUInt()));
     break;
   case realValue:
-    pushValue(valueToString(value.asDouble()));
+    pushValue(valueToString(value.asDouble(), useSpecialFloats_, precision_));
     break;
   case stringValue:
   {
@@ -914,7 +945,7 @@ void BuiltStyledStreamWriter::writeValue(Value const& value) {
         std::string const& name = *it;
         Value const& childValue = value[name];
         writeCommentBeforeValue(childValue);
-        writeWithIndent(valueToQuotedStringN(name.data(), name.length()));
+        writeWithIndent(valueToQuotedStringN(name.data(), static_cast<unsigned>(name.length())));
         *sout_ << colonSymbol_;
         writeValue(childValue);
         if (++it == members.end()) {
@@ -979,26 +1010,25 @@ void BuiltStyledStreamWriter::writeArrayValue(Value const& value) {
 }
 
 bool BuiltStyledStreamWriter::isMultineArray(Value const& value) {
-  int size = value.size();
+  ArrayIndex const size = value.size();
   bool isMultiLine = size * 3 >= rightMargin_;
   childValues_.clear();
-  for (int index = 0; index < size && !isMultiLine; ++index) {
+  for (ArrayIndex index = 0; index < size && !isMultiLine; ++index) {
     Value const& childValue = value[index];
-    isMultiLine =
-        isMultiLine || ((childValue.isArray() || childValue.isObject()) &&
+    isMultiLine = ((childValue.isArray() || childValue.isObject()) &&
                         childValue.size() > 0);
   }
   if (!isMultiLine) // check if line length > max line length
   {
     childValues_.reserve(size);
     addChildValues_ = true;
-    int lineLength = 4 + (size - 1) * 2; // '[ ' + ', '*n + ' ]'
-    for (int index = 0; index < size; ++index) {
+    ArrayIndex lineLength = 4 + (size - 1) * 2; // '[ ' + ', '*n + ' ]'
+    for (ArrayIndex index = 0; index < size; ++index) {
       if (hasCommentForValue(value[index])) {
         isMultiLine = true;
       }
       writeValue(value[index]);
-      lineLength += int(childValues_[index].length());
+      lineLength += static_cast<ArrayIndex>(childValues_[index].length());
     }
     addChildValues_ = false;
     isMultiLine = isMultiLine || lineLength >= rightMargin_;
@@ -1099,6 +1129,8 @@ StreamWriter* StreamWriterBuilder::newStreamWriter() const
   std::string cs_str = settings_["commentStyle"].asString();
   bool eyc = settings_["enableYAMLCompatibility"].asBool();
   bool dnp = settings_["dropNullPlaceholders"].asBool();
+  bool usf = settings_["useSpecialFloats"].asBool(); 
+  unsigned int pre = settings_["precision"].asUInt();
   CommentStyle::Enum cs = CommentStyle::All;
   if (cs_str == "All") {
     cs = CommentStyle::All;
@@ -1117,10 +1149,11 @@ StreamWriter* StreamWriterBuilder::newStreamWriter() const
   if (dnp) {
     nullSymbol = "";
   }
+  if (pre > 17) pre = 17;
   std::string endingLineFeedSymbol = "";
   return new BuiltStyledStreamWriter(
       indentation, cs,
-      colonSymbol, nullSymbol, endingLineFeedSymbol);
+      colonSymbol, nullSymbol, endingLineFeedSymbol, usf, pre);
 }
 static void getValidWriterKeys(std::set<std::string>* valid_keys)
 {
@@ -1129,6 +1162,8 @@ static void getValidWriterKeys(std::set<std::string>* valid_keys)
   valid_keys->insert("commentStyle");
   valid_keys->insert("enableYAMLCompatibility");
   valid_keys->insert("dropNullPlaceholders");
+  valid_keys->insert("useSpecialFloats");
+  valid_keys->insert("precision");
 }
 bool StreamWriterBuilder::validate(Json::Value* invalid) const
 {
@@ -1159,6 +1194,8 @@ void StreamWriterBuilder::setDefaults(Json::Value* settings)
   (*settings)["indentation"] = "\t";
   (*settings)["enableYAMLCompatibility"] = false;
   (*settings)["dropNullPlaceholders"] = false;
+  (*settings)["useSpecialFloats"] = false;
+  (*settings)["precision"] = 17;
   //! [StreamWriterBuilderDefaults]
 }
 

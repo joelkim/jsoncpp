@@ -17,9 +17,26 @@
 #include <sstream>
 #include <memory>
 #include <set>
+#include <limits>
 
-#if defined(_MSC_VER) && _MSC_VER < 1500 // VC++ 8.0 and below
+#if defined(_MSC_VER)
+#if !defined(WINCE) && defined(__STDC_SECURE_LIB__) && _MSC_VER >= 1500 // VC++ 9.0 and above 
+#define snprintf sprintf_s
+#elif _MSC_VER >= 1900 // VC++ 14.0 and above
+#define snprintf std::snprintf
+#else
 #define snprintf _snprintf
+#endif
+#elif defined(__ANDROID__) || defined(__QNXNTO__)
+#define snprintf snprintf
+#elif __cplusplus >= 201103L
+#if !defined(__MINGW32__) && !defined(__CYGWIN__)
+#define snprintf std::snprintf
+#endif
+#endif
+
+#if defined(__QNXNTO__)
+#define sscanf std::sscanf
 #endif
 
 #if defined(_MSC_VER) && _MSC_VER >= 1400 // VC++ 8.0
@@ -32,7 +49,7 @@ static int       stackDepth_g = 0;  // see readValue()
 
 namespace Json {
 
-#if __cplusplus >= 201103L
+#if __cplusplus >= 201103L || (defined(_CPPLIB_VER) && _CPPLIB_VER >= 520)
 typedef std::unique_ptr<CharReader> CharReaderPtr;
 #else
 typedef std::auto_ptr<CharReader>   CharReaderPtr;
@@ -353,7 +370,7 @@ bool Reader::readComment() {
 
 static std::string normalizeEOL(Reader::Location begin, Reader::Location end) {
   std::string normalized;
-  normalized.reserve(end - begin);
+  normalized.reserve(static_cast<size_t>(end - begin));
   Reader::Location current = begin;
   while (current != end) {
     char c = *current++;
@@ -555,7 +572,7 @@ bool Reader::decodeNumber(Token& token, Value& decoded) {
     ++current;
   // TODO: Help the compiler do the div and mod at compile time or get rid of them.
   Value::LargestUInt maxIntegerValue =
-      isNegative ? Value::LargestUInt(-Value::minLargestInt)
+      isNegative ? Value::LargestUInt(Value::maxLargestInt) + 1
                  : Value::maxLargestUInt;
   Value::LargestUInt threshold = maxIntegerValue / 10;
   Value::LargestUInt value = 0;
@@ -563,7 +580,7 @@ bool Reader::decodeNumber(Token& token, Value& decoded) {
     Char c = *current++;
     if (c < '0' || c > '9')
       return decodeDouble(token, decoded);
-    Value::UInt digit(c - '0');
+    Value::UInt digit(static_cast<Value::UInt>(c - '0'));
     if (value >= threshold) {
       // We've hit or exceeded the max value divided by 10 (rounded down). If
       // a) we've only just touched the limit, b) this is the last digit, and
@@ -576,7 +593,9 @@ bool Reader::decodeNumber(Token& token, Value& decoded) {
     }
     value = value * 10 + digit;
   }
-  if (isNegative)
+  if (isNegative && value == maxIntegerValue)
+    decoded = Value::minLargestInt;
+  else if (isNegative)
     decoded = -Value::LargestInt(value);
   else if (value <= Value::LargestUInt(Value::maxInt))
     decoded = Value::LargestInt(value);
@@ -597,33 +616,9 @@ bool Reader::decodeDouble(Token& token) {
 
 bool Reader::decodeDouble(Token& token, Value& decoded) {
   double value = 0;
-  const int bufferSize = 32;
-  int count;
-  int length = int(token.end_ - token.start_);
-
-  // Sanity check to avoid buffer overflow exploits.
-  if (length < 0) {
-    return addError("Unable to parse token length", token);
-  }
-
-  // Avoid using a string constant for the format control string given to
-  // sscanf, as this can cause hard to debug crashes on OS X. See here for more
-  // info:
-  //
-  //     http://developer.apple.com/library/mac/#DOCUMENTATION/DeveloperTools/gcc-4.0.1/gcc/Incompatibilities.html
-  char format[] = "%lf";
-
-  if (length <= bufferSize) {
-    Char buffer[bufferSize + 1];
-    memcpy(buffer, token.start_, length);
-    buffer[length] = 0;
-    count = sscanf(buffer, format, &value);
-  } else {
-    std::string buffer(token.start_, token.end_);
-    count = sscanf(buffer.c_str(), format, &value);
-  }
-
-  if (count != 1)
+  std::string buffer(token.start_, token.end_);
+  std::istringstream is(buffer);
+  if (!(is >> value))
     return addError("'" + std::string(token.start_, token.end_) +
                         "' is not a number.",
                     token);
@@ -643,7 +638,7 @@ bool Reader::decodeString(Token& token) {
 }
 
 bool Reader::decodeString(Token& token, std::string& decoded) {
-  decoded.reserve(token.end_ - token.start_ - 2);
+  decoded.reserve(static_cast<size_t>(token.end_ - token.start_ - 2));
   Location current = token.start_ + 1; // skip '"'
   Location end = token.end_ - 1;       // do not include '"'
   while (current != end) {
@@ -727,13 +722,13 @@ bool Reader::decodeUnicodeCodePoint(Token& token,
 bool Reader::decodeUnicodeEscapeSequence(Token& token,
                                          Location& current,
                                          Location end,
-                                         unsigned int& unicode) {
+                                         unsigned int& ret_unicode) {
   if (end - current < 4)
     return addError(
         "Bad unicode escape sequence in string: four digits expected.",
         token,
         current);
-  unicode = 0;
+  int unicode = 0;
   for (int index = 0; index < 4; ++index) {
     Char c = *current++;
     unicode *= 16;
@@ -749,6 +744,7 @@ bool Reader::decodeUnicodeEscapeSequence(Token& token,
           token,
           current);
   }
+  ret_unicode = static_cast<unsigned int>(unicode);
   return true;
 }
 
@@ -763,7 +759,7 @@ Reader::addError(const std::string& message, Token& token, Location extra) {
 }
 
 bool Reader::recoverFromError(TokenType skipUntilToken) {
-  int errorCount = int(errors_.size());
+  size_t const errorCount = errors_.size();
   Token skip;
   for (;;) {
     if (!readToken(skip))
@@ -817,15 +813,7 @@ std::string Reader::getLocationLineAndColumn(Location location) const {
   int line, column;
   getLocationLineAndColumn(location, line, column);
   char buffer[18 + 16 + 16 + 1];
-#if defined(_MSC_VER) && defined(__STDC_SECURE_LIB__)
-#if defined(WINCE)
-  _snprintf(buffer, sizeof(buffer), "Line %d, Column %d", line, column);
-#else
-  sprintf_s(buffer, sizeof(buffer), "Line %d, Column %d", line, column);
-#endif
-#else
   snprintf(buffer, sizeof(buffer), "Line %d, Column %d", line, column);
-#endif
   return buffer;
 }
 
@@ -866,7 +854,7 @@ std::vector<Reader::StructuredError> Reader::getStructuredErrors() const {
 }
 
 bool Reader::pushError(const Value& value, const std::string& message) {
-  size_t length = end_ - begin_;
+  ptrdiff_t const length = end_ - begin_;
   if(value.getOffsetStart() > length
     || value.getOffsetLimit() > length)
     return false;
@@ -883,7 +871,7 @@ bool Reader::pushError(const Value& value, const std::string& message) {
 }
 
 bool Reader::pushError(const Value& value, const std::string& message, const Value& extra) {
-  size_t length = end_ - begin_;
+  ptrdiff_t const length = end_ - begin_;
   if(value.getOffsetStart() > length
     || value.getOffsetLimit() > length
     || extra.getOffsetLimit() > length)
@@ -908,7 +896,6 @@ bool Reader::good() const {
 class OurFeatures {
 public:
   static OurFeatures all();
-  OurFeatures();
   bool allowComments_;
   bool strictRoot_;
   bool allowDroppedNullPlaceholders_;
@@ -916,19 +903,12 @@ public:
   bool allowSingleQuotes_;
   bool failIfExtra_;
   bool rejectDupKeys_;
+  bool allowSpecialFloats_;
   int stackLimit_;
 };  // OurFeatures
 
 // exact copy of Implementation of class Features
 // ////////////////////////////////
-
-OurFeatures::OurFeatures()
-    : allowComments_(true), strictRoot_(false)
-    , allowDroppedNullPlaceholders_(false), allowNumericKeys_(false)
-    , allowSingleQuotes_(false)
-    , failIfExtra_(false)
-{
-}
 
 OurFeatures OurFeatures::all() { return OurFeatures(); }
 
@@ -941,8 +921,8 @@ public:
   typedef char Char;
   typedef const Char* Location;
   struct StructuredError {
-    size_t offset_start;
-    size_t offset_limit;
+    ptrdiff_t offset_start;
+    ptrdiff_t offset_limit;
     std::string message;
   };
 
@@ -972,6 +952,9 @@ private:
     tokenTrue,
     tokenFalse,
     tokenNull,
+    tokenNaN,
+    tokenPosInf,
+    tokenNegInf,
     tokenArraySeparator,
     tokenMemberSeparator,
     tokenComment,
@@ -1002,7 +985,7 @@ private:
   bool readCppStyleComment();
   bool readString();
   bool readStringSingleQuote();
-  void readNumber();
+  bool readNumber(bool checkInf);
   bool readValue();
   bool readObject(Token& token);
   bool readArray(Token& token);
@@ -1054,7 +1037,9 @@ private:
 
 OurReader::OurReader(OurFeatures const& features)
     : errors_(), document_(), begin_(), end_(), current_(), lastValueEnd_(),
-      lastValue_(), commentsBefore_(), features_(features), collectComments_() {
+      lastValue_(), commentsBefore_(),
+      stackDepth_(0),
+      features_(features), collectComments_() {
 }
 
 bool OurReader::parse(const char* beginDoc,
@@ -1156,6 +1141,30 @@ bool OurReader::readValue() {
     currentValue().setOffsetLimit(token.end_ - begin_);
     }
     break;
+  case tokenNaN:
+    {
+    Value v(std::numeric_limits<double>::quiet_NaN());
+    currentValue().swapPayload(v);
+    currentValue().setOffsetStart(token.start_ - begin_);
+    currentValue().setOffsetLimit(token.end_ - begin_);
+    }
+    break;
+  case tokenPosInf:
+    {
+    Value v(std::numeric_limits<double>::infinity());
+    currentValue().swapPayload(v);
+    currentValue().setOffsetStart(token.start_ - begin_);
+    currentValue().setOffsetLimit(token.end_ - begin_);
+    }
+    break;
+  case tokenNegInf:
+    {
+    Value v(-std::numeric_limits<double>::infinity());
+    currentValue().swapPayload(v);
+    currentValue().setOffsetStart(token.start_ - begin_);
+    currentValue().setOffsetLimit(token.end_ - begin_);
+    }
+    break;
   case tokenArraySeparator:
   case tokenObjectEnd:
   case tokenArrayEnd:
@@ -1236,9 +1245,16 @@ bool OurReader::readToken(Token& token) {
   case '7':
   case '8':
   case '9':
-  case '-':
     token.type_ = tokenNumber;
-    readNumber();
+    readNumber(false);
+    break;
+  case '-':
+    if (readNumber(true)) {
+      token.type_ = tokenNumber;
+    } else {
+      token.type_ = tokenNegInf;
+      ok = features_.allowSpecialFloats_ && match("nfinity", 7);
+    }
     break;
   case 't':
     token.type_ = tokenTrue;
@@ -1251,6 +1267,22 @@ bool OurReader::readToken(Token& token) {
   case 'n':
     token.type_ = tokenNull;
     ok = match("ull", 3);
+    break;
+  case 'N':
+    if (features_.allowSpecialFloats_) {
+      token.type_ = tokenNaN;
+      ok = match("aN", 2);
+    } else {
+      ok = false;
+    }
+    break;
+  case 'I':
+    if (features_.allowSpecialFloats_) {
+      token.type_ = tokenPosInf;
+      ok = match("nfinity", 7);
+    } else {
+      ok = false;
+    }
     break;
   case ',':
     token.type_ = tokenArraySeparator;
@@ -1352,8 +1384,12 @@ bool OurReader::readCppStyleComment() {
   return true;
 }
 
-void OurReader::readNumber() {
+bool OurReader::readNumber(bool checkInf) {
   const char *p = current_;
+  if (checkInf && p != end_ && *p == 'I') {
+    current_ = ++p;
+    return false;
+  }
   char c = '0'; // stopgap for already consumed character
   // integral part
   while (c >= '0' && c <= '9')
@@ -1372,6 +1408,7 @@ void OurReader::readNumber() {
     while (c >= '0' && c <= '9')
       c = (current_ = p) < end_ ? *p++ : 0;
   }
+  return true;
 }
 bool OurReader::readString() {
   Char c = 0;
@@ -1526,7 +1563,7 @@ bool OurReader::decodeNumber(Token& token, Value& decoded) {
     Char c = *current++;
     if (c < '0' || c > '9')
       return decodeDouble(token, decoded);
-    Value::UInt digit(c - '0');
+    Value::UInt digit(static_cast<Value::UInt>(c - '0'));
     if (value >= threshold) {
       // We've hit or exceeded the max value divided by 10 (rounded down). If
       // a) we've only just touched the limit, b) this is the last digit, and
@@ -1562,12 +1599,13 @@ bool OurReader::decodeDouble(Token& token, Value& decoded) {
   double value = 0;
   const int bufferSize = 32;
   int count;
-  int length = int(token.end_ - token.start_);
+  ptrdiff_t const length = token.end_ - token.start_;
 
   // Sanity check to avoid buffer overflow exploits.
   if (length < 0) {
     return addError("Unable to parse token length", token);
   }
+  size_t const ulength = static_cast<size_t>(length);
 
   // Avoid using a string constant for the format control string given to
   // sscanf, as this can cause hard to debug crashes on OS X. See here for more
@@ -1578,7 +1616,7 @@ bool OurReader::decodeDouble(Token& token, Value& decoded) {
 
   if (length <= bufferSize) {
     Char buffer[bufferSize + 1];
-    memcpy(buffer, token.start_, length);
+    memcpy(buffer, token.start_, ulength);
     buffer[length] = 0;
     count = sscanf(buffer, format, &value);
   } else {
@@ -1606,7 +1644,7 @@ bool OurReader::decodeString(Token& token) {
 }
 
 bool OurReader::decodeString(Token& token, std::string& decoded) {
-  decoded.reserve(token.end_ - token.start_ - 2);
+  decoded.reserve(static_cast<size_t>(token.end_ - token.start_ - 2));
   Location current = token.start_ + 1; // skip '"'
   Location end = token.end_ - 1;       // do not include '"'
   while (current != end) {
@@ -1690,13 +1728,13 @@ bool OurReader::decodeUnicodeCodePoint(Token& token,
 bool OurReader::decodeUnicodeEscapeSequence(Token& token,
                                          Location& current,
                                          Location end,
-                                         unsigned int& unicode) {
+                                         unsigned int& ret_unicode) {
   if (end - current < 4)
     return addError(
         "Bad unicode escape sequence in string: four digits expected.",
         token,
         current);
-  unicode = 0;
+  int unicode = 0;
   for (int index = 0; index < 4; ++index) {
     Char c = *current++;
     unicode *= 16;
@@ -1712,6 +1750,7 @@ bool OurReader::decodeUnicodeEscapeSequence(Token& token,
           token,
           current);
   }
+  ret_unicode = static_cast<unsigned int>(unicode);
   return true;
 }
 
@@ -1726,7 +1765,7 @@ OurReader::addError(const std::string& message, Token& token, Location extra) {
 }
 
 bool OurReader::recoverFromError(TokenType skipUntilToken) {
-  int errorCount = int(errors_.size());
+  size_t errorCount = errors_.size();
   Token skip;
   for (;;) {
     if (!readToken(skip))
@@ -1780,15 +1819,7 @@ std::string OurReader::getLocationLineAndColumn(Location location) const {
   int line, column;
   getLocationLineAndColumn(location, line, column);
   char buffer[18 + 16 + 16 + 1];
-#if defined(_MSC_VER) && defined(__STDC_SECURE_LIB__)
-#if defined(WINCE)
-  _snprintf(buffer, sizeof(buffer), "Line %d, Column %d", line, column);
-#else
-  sprintf_s(buffer, sizeof(buffer), "Line %d, Column %d", line, column);
-#endif
-#else
   snprintf(buffer, sizeof(buffer), "Line %d, Column %d", line, column);
-#endif
   return buffer;
 }
 
@@ -1824,7 +1855,7 @@ std::vector<OurReader::StructuredError> OurReader::getStructuredErrors() const {
 }
 
 bool OurReader::pushError(const Value& value, const std::string& message) {
-  size_t length = end_ - begin_;
+  ptrdiff_t length = end_ - begin_;
   if(value.getOffsetStart() > length
     || value.getOffsetLimit() > length)
     return false;
@@ -1841,7 +1872,7 @@ bool OurReader::pushError(const Value& value, const std::string& message) {
 }
 
 bool OurReader::pushError(const Value& value, const std::string& message, const Value& extra) {
-  size_t length = end_ - begin_;
+  ptrdiff_t length = end_ - begin_;
   if(value.getOffsetStart() > length
     || value.getOffsetLimit() > length
     || extra.getOffsetLimit() > length)
@@ -1873,9 +1904,9 @@ public:
   : collectComments_(collectComments)
   , reader_(features)
   {}
-  virtual bool parse(
+  bool parse(
       char const* beginDoc, char const* endDoc,
-      Value* root, std::string* errs) {
+      Value* root, std::string* errs) override {
     bool ok = reader_.parse(beginDoc, endDoc, *root, collectComments_);
     if (errs) {
       *errs = reader_.getFormattedErrorMessages();
@@ -1902,6 +1933,7 @@ CharReader* CharReaderBuilder::newCharReader() const
   features.stackLimit_ = settings_["stackLimit"].asInt();
   features.failIfExtra_ = settings_["failIfExtra"].asBool();
   features.rejectDupKeys_ = settings_["rejectDupKeys"].asBool();
+  features.allowSpecialFloats_ = settings_["allowSpecialFloats"].asBool();
   return new OurCharReader(collectComments, features);
 }
 static void getValidReaderKeys(std::set<std::string>* valid_keys)
@@ -1916,6 +1948,7 @@ static void getValidReaderKeys(std::set<std::string>* valid_keys)
   valid_keys->insert("stackLimit");
   valid_keys->insert("failIfExtra");
   valid_keys->insert("rejectDupKeys");
+  valid_keys->insert("allowSpecialFloats");
 }
 bool CharReaderBuilder::validate(Json::Value* invalid) const
 {
@@ -1947,8 +1980,10 @@ void CharReaderBuilder::strictMode(Json::Value* settings)
   (*settings)["allowDroppedNullPlaceholders"] = false;
   (*settings)["allowNumericKeys"] = false;
   (*settings)["allowSingleQuotes"] = false;
+  (*settings)["stackLimit"] = 1000;
   (*settings)["failIfExtra"] = true;
   (*settings)["rejectDupKeys"] = true;
+  (*settings)["allowSpecialFloats"] = false;
 //! [CharReaderBuilderStrictMode]
 }
 // static
@@ -1964,6 +1999,7 @@ void CharReaderBuilder::setDefaults(Json::Value* settings)
   (*settings)["stackLimit"] = 1000;
   (*settings)["failIfExtra"] = false;
   (*settings)["rejectDupKeys"] = false;
+  (*settings)["allowSpecialFloats"] = false;
 //! [CharReaderBuilderDefaults]
 }
 
@@ -1993,7 +2029,7 @@ std::istream& operator>>(std::istream& sin, Value& root) {
             "Error from reader: %s",
             errs.c_str());
 
-    throwRuntimeError("reader error");
+    throwRuntimeError(errs);
   }
   return sin;
 }
